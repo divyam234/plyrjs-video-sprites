@@ -3,23 +3,19 @@ import sys
 import makesprites
 import shutil
 import os
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 
-# Batch process a text file containing list of videos (paths or urls) to make sprites for,
-# and a destination directory for just the sprites/vtt files
-#    files get put into DESTINATION/##/*  where ## is the 2 letter prefix of the output files, and * are output files
+OUTPUT_FOLDER = "out"
 
-# python batchsprites.py filelist.txt
-# python batchsprites.py filelist.txt 20  #thumbnail every 20 sec
-
-OUTPUT_FOLDER = "/Users/vlanard/myproject_git/ubuntu/proj/prototype/static/inc/th"
+MAX_WORKERS=4
 
 if not len(sys.argv) > 1 :
     sys.exit("Please pass the full path to file containing the video list for which to create thumbnails.")
 
-def copyFile(origfile):
+def copyFile(origfile,output_folder):
     thefile = os.path.basename(origfile)
-    prefix = thefile[:2] #store in subdirectory that begins with 2 letter prefix of the files within it
-    outputFolder = os.path.join(OUTPUT_FOLDER,prefix)
+    outputFolder = os.path.join(OUTPUT_FOLDER,output_folder)
     if not os.path.exists(outputFolder):
         try:
             os.makedirs(outputFolder)
@@ -28,24 +24,24 @@ def copyFile(origfile):
     outfile = os.path.join(outputFolder,thefile)
     shutil.copy(origfile,outfile)
 
+
+
+def generate_sprite(file_path,output_folder):
+    task = makesprites.SpriteTask(file_path)
+    makesprites.run(task)
+    spritefile = task.getSpriteFile()
+    vttfile = task.getVTTFile()
+    copyFile(spritefile,output_folder)
+    copyFile(vttfile,output_folder)
+
+def main(video_list):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+          futures=[]
+          for video in video_list:
+            futures.append(executor.submit(generate_sprite,video))
+          for future in as_completed(futures):
+            print(future.result())
+
 if __name__ == "__main__":
-    videolist = sys.argv[1]
-    thumbRate = None
-    #optionally pass in a 2nd arg that is number for every Nth second you want to take a snapshot
-    if len(sys.argv)> 2:
-        thumbRate = int(sys.argv[2])
-        print "Taking snapshot every %d seconds" % thumbRate
-
-    with open (videolist) as fh:
-        for video in fh:
-            video = video.strip()
-            if video.startswith("#") or not video:
-                continue
-            task = makesprites.SpriteTask(video)
-            makesprites.run(task,thumbRate=thumbRate)
-            spritefile = task.getSpriteFile()
-            vttfile = task.getVTTFile()
-            #batch move the generated sprites
-            copyFile(spritefile)
-            copyFile(vttfile)
-
+    video_list=[]
+    main(video_list)

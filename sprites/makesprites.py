@@ -24,15 +24,12 @@ from dateutil import relativedelta
 
 #TODO determine optimal number of images/segment distance based on length of video? (so longer videos don't have huge sprites)
 
-USE_SIPS = True #True to use sips if using MacOSX (creates slightly smaller sprites), else set to False to use ImageMagick
-THUMB_RATE_SECONDS=45 # every Nth second take a snapshot
-THUMB_WIDTH=100 #100-150 is width recommended by JWPlayer; I like smaller files
-SKIP_FIRST=True #True to skip a thumbnail of second 1; often not a useful image, plus JWPlayer doesn't seem to show it anyway, and user knows beginning without needing preview
+USE_SIPS = False #True to use sips if using MacOSX (creates slightly smaller sprites), else set to False to use ImageMagick
+THUMB_WIDTH=240#100-150 is width recommended by JWPlayer; I like smaller files
 SPRITE_NAME = "sprite.jpg" #jpg is much smaller than png, so using jpg
 VTTFILE_NAME = "thumbs.vtt"
 THUMB_OUTDIR = "thumbs"
 USE_UNIQUE_OUTDIR = False #true to make a unique timestamped output dir each time, else False to overwrite/replace existing outdir
-TIMESYNC_ADJUST = -.5 #set to 1 to not adjust time (gets multiplied by thumbRate); On my machine,ffmpeg snapshots show earlier images than expected timestamp by about 1/2 the thumbRate (for one vid, 10s thumbrate->images were 6s earlier than expected;45->22s early,90->44 sec early)
 logger = logging.getLogger(sys.argv[0])
 logSetup=False
 
@@ -80,40 +77,34 @@ def makeOutDir(videofile):
     elif os.path.exists(newoutdir) and not USE_UNIQUE_OUTDIR:
         #remove previous contents if reusing outdir
         files = os.listdir(newoutdir)
-        print "Removing previous contents of output directory: %s" % newoutdir
+        print ("Removing previous contents of output directory: %s" % newoutdir)
         for f in files:
             os.unlink(os.path.join(newoutdir,f))
     return newoutdir
 
 def doCmd(cmd,logger=logger):  #execute a shell command and return/print its output
-    logger.info( "START [%s] : %s " % (datetime.datetime.now(), cmd))
+    #logger.info( "START [%s] : %s " % (datetime.datetime.now(), cmd))
     args = shlex.split(cmd) #tokenize args
     output = None
     try:
-        output = subprocess.check_output(args, stderr=subprocess.STDOUT) #pipe stderr into stdout
-    except Exception, e:
+        output = subprocess.run(args, check=True, capture_output=True, text=True).stdout #pipe stderr into stdout
+    except Exception as e:
         ret = "ERROR   [%s] An exception occurred\n%s\n%s" % (datetime.datetime.now(),output,str(e))
         logger.error(ret)
         raise e #todo ?
     ret = "END   [%s]\n%s" % (datetime.datetime.now(),output)
-    logger.info(ret)
+    #logger.info(ret)
     sys.stdout.flush()
     return output
 
-def takesnaps(videofile,newoutdir,thumbRate=None):
+def takesnaps(videofile,newoutdir):
     """
     take snapshot image of video every Nth second and output to sequence file names and custom directory
         reference: https://trac.ffmpeg.org/wiki/Create%20a%20thumbnail%20image%20every%20X%20seconds%20of%20the%20video
     """
-    if not thumbRate:
-        thumbRate = THUMB_RATE_SECONDS
-    rate = "1/%d" % thumbRate # 1/60=1 per minute, 1/120=1 every 2 minutes
-    cmd = "ffmpeg -i %s -f image2 -bt 20M -vf fps=%s -aspect 16:9 %s/tv%%03d.jpg" % (pipes.quote(videofile), rate, pipes.quote(newoutdir))
+
+    cmd = "ffmpeg -skip_frame nokey -i %s -qscale:v 2 -vsync passthrough %s/tv%%03d.jpg" % (pipes.quote(videofile), pipes.quote(newoutdir))
     doCmd (cmd)
-    if SKIP_FIRST:
-        #remove the first image
-        logger.info("Removing first image, unneeded")
-        os.unlink("%s/tv001.jpg" % newoutdir)
     count = len(os.listdir(newoutdir))
     logger.info("%d thumbs written in %s" % (count,newoutdir))
     #return the list of generated files
@@ -145,49 +136,33 @@ def get_geometry(file):
     parts = geom.split("-",1)
     return parts[0].strip() #return just the geometry prefix of the line, sans extra whitespace
 
-def makevtt(spritefile,numsegments,coords,gridsize,writefile,thumbRate=None):
+def get_frametime(file):
+    timestamps = doCmd("""ffprobe -loglevel error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=print_section=0 %s""" % pipes.quote(file)).split('\n')
+    keyframes=list(map(lambda y : y.split(',')[0],filter(lambda x: x.find('K')!=-1,timestamps)))
+    keyframes.append(timestamps[-2].split(',')[0])
+    return keyframes
+
+def makevtt(spritefile,numsegments,keyframes,coords,gridsize,writefile):
     """generate & write vtt file mapping video time to each image's coordinates
     in our spritemap"""
     #split geometry string into individual parts
     ##4200x66+0+0     ===  WxH+X+Y
-    if not thumbRate:
-        thumbRate = THUMB_RATE_SECONDS
     wh,xy = coords.split("+",1)
     w,h = wh.split("x")
     w = int(w)
     h = int(h)
     #x,y = xy.split("+")
-#======= SAMPLE WEBVTT FILE=====
-#WEBVTT
-#
-#00:00.000 --> 00:05.000
-#/assets/thumbnails.jpg#xywh=0,0,160,90
-#
-#00:05.000 --> 00:10.000
-#/assets/preview2.jpg#xywh=160,0,320,90
-#
-#00:10.000 --> 00:15.000
-#/assets/preview3.jpg#xywh=0,90,160,180
-#
-#00:15.000 --> 00:20.000
-#/assets/preview4.jpg#xywh=160,90,320,180
-#==== END SAMPLE ========
+
     basefile = os.path.basename(spritefile)
     vtt = ["WEBVTT",""] #line buffer for file contents
-    if SKIP_FIRST:
-        clipstart = thumbRate  #offset time to skip the first image
-    else:
-        clipstart = 0
     # NOTE - putting a time gap between thumbnail end & next start has no visual effect in JWPlayer, so not doing it.
-    clipend = clipstart + thumbRate
-    adjust = thumbRate * TIMESYNC_ADJUST
-    for imgnum in range(1,numsegments+1):
+    clipstart=float(keyframes[0])
+    for imgnum in range(0,numsegments):
         xywh = get_grid_coordinates(imgnum,gridsize,w,h)
-        start = get_time_str(clipstart,adjust=adjust)
-        end  = get_time_str(clipend,adjust=adjust)
-        clipstart = clipend
-        clipend += thumbRate
-        vtt.append("Img %d" % imgnum)
+        start = get_time_str(clipstart)
+        end  = get_time_str(float(keyframes[imgnum+1]))
+        clipstart = float(keyframes[imgnum+1])
+        vtt.append(str(imgnum))
         vtt.append("%s --> %s" % (start,end)) #00:00.000 --> 00:05.000
         vtt.append("%s#xywh=%s" % (basefile,xywh))
         vtt.append("") #Linebreak
@@ -206,8 +181,8 @@ def get_time_str(numseconds,adjust=None):
 
 def get_grid_coordinates(imgnum,gridsize,w,h):
     """ given an image number in our sprite, map the coordinates to it in X,Y,W,H format"""
-    y = (imgnum - 1)/gridsize
-    x = (imgnum -1) - (y * gridsize)
+    x= int(imgnum % gridsize);
+    y = int(imgnum /gridsize)
     imgx = x * w
     imgy =y * h
     return "%s,%s,%s,%s" % (imgx,imgy,w,h)
@@ -242,17 +217,19 @@ def removespeed(videofile):
         pass
     return videofile
 
-def run(task, thumbRate=None):
+def run(task):
     addLogging()
-    if not thumbRate:
-        thumbRate = THUMB_RATE_SECONDS
     outdir = task.getOutdir()
     spritefile = task.getSpriteFile()
 
     #create snapshots
-    numfiles,thumbfiles = takesnaps(task.getVideoFile(),outdir, thumbRate=thumbRate)
+    numfiles,thumbfiles = takesnaps(task.getVideoFile(),outdir)
     #resize them to be mini
     resize(thumbfiles)
+
+    #get key frames time
+
+    keyframes=get_frametime(task.getVideoFile())
 
     #get coordinates from a resized file to use in spritemapping
     gridsize = int(math.ceil(math.sqrt(numfiles)))
@@ -262,7 +239,7 @@ def run(task, thumbRate=None):
     makesprite(outdir,spritefile,coords,gridsize)
 
     #generate a vtt with coordinates to each image in sprite
-    makevtt(spritefile,numfiles,coords,gridsize,task.getVTTFile(), thumbRate=thumbRate)
+    makevtt(spritefile,numfiles,keyframes,coords,gridsize,task.getVTTFile())
 
 def addLogging():
     global logSetup
@@ -270,7 +247,7 @@ def addLogging():
         basescript = os.path.splitext(os.path.basename(sys.argv[0]))[0]
         LOG_FILENAME = 'logs/%s.%s.log'% (basescript,datetime.datetime.now().strftime("%Y%m%d_%H%M%S")) #new log per job so we can run this program concurrently
         #CONSOLE AND FILE LOGGING
-        print "Writing log to: %s" % LOG_FILENAME
+        print ("Writing log to: %s" % LOG_FILENAME)
         if not os.path.exists('logs'):
             os.makedirs('logs')
         logger.setLevel(logging.DEBUG)
